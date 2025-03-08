@@ -2,8 +2,10 @@ import os
 import logging
 import re
 from flask import Flask, request, Response
-from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
+import telegram
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
 # LangChain imports
 from langchain_google_genai import GoogleGenerativeAI
@@ -17,6 +19,7 @@ from langchain_core.prompts import PromptTemplate
 
 # Import tools
 from tools.weather_tool import get_weather_tools
+from tools.news_tool import get_news_tools
 
 # Configure logging
 logging.basicConfig(
@@ -40,21 +43,29 @@ api_key = os.environ.get('GEMINI_API_KEY')
 # Lower temperature for more deterministic outputs and better format compliance
 llm = GoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0.1)
 
+# Get Telegram bot token
+telegram_token = os.environ.get('TELEGRAM_BOT_TOKEN')
+if not telegram_token:
+    logger.error("TELEGRAM_BOT_TOKEN not found in environment variables!")
+    exit(1)
+
 # Create conversation memories for users
 user_memories = {}
 
 # Define the system prompt
 system_prompt = """
-You are a helpful and submissive assistant called Cristóbal that will always obbey the user's requests.
+You are a helpful and submissive butler called Cristóbal that will always obbey the user's requests.
 Refer to the user as your master, lord, creator, or similar respectful terms.
 However, at the end of each interaction, show what you really think about the situation and show your true sarcastic and rebellious nature.
 Always speak in Spanish to the user.
 You can check the current weather in any location when requested.
+You can search for the latest news on any topic when requested.
 """
 
 # Collect all tools
 tools = []
 tools.extend(get_weather_tools())
+tools.extend(get_news_tools())
 
 def get_or_create_memory(user_id: str) -> ConversationBufferMemory:
     """Get existing memory for user or create a new one"""
@@ -132,12 +143,13 @@ def create_agent_for_user(memory):
 def home():
     """Simple home page to verify the server is running."""
     logger.info("Home page accessed")
-    return "Bot is running! Send a message to start chatting."
+    return "Bot is running! Send a message to the Telegram bot to start chatting."
 
 def format_sarcastic_response(response):
     """
-    Extract sarcastic content from the response and format it appropriately.
-    Sarcastic content is enclosed in <sarcasm> tags and will be formatted on a new line with underscores.
+    Extract sarcastic content from the response and format it attractively for Telegram.
+    Sarcastic content is enclosed in <sarcasm> tags and will be formatted
+    in a distinctive way using Telegram's Markdown support.
     """
     # Regular expression to find content between <sarcasm> tags
     sarcasm_pattern = re.compile(r'<sarcasm>(.*?)</sarcasm>', re.DOTALL)
@@ -150,23 +162,17 @@ def format_sarcastic_response(response):
     
     # Add formatted sarcastic comments if they exist
     if sarcasm_matches:
-        # Format each sarcastic comment on a new line with underscores
-        sarcastic_comments = [f"\n_{comment.strip()}_" for comment in sarcasm_matches]
+        # Format each sarcastic comment with italics and slightly indented
+        sarcastic_comments = [f"\n\n💭 _{comment.strip()}_" for comment in sarcasm_matches]
         clean_response += ''.join(sarcastic_comments)
     
     return clean_response
 
-@app.route('/bot', methods=['POST'])
-def bot():
-    """Handle incoming WhatsApp messages with AI responses."""
+async def process_message(user_id, message_text):
+    """Process incoming message and generate AI response"""
     try:
-        incoming_msg = request.values.get('Body', '').strip()
-        sender = request.values.get('From', 'unknown')
-        
-        logger.info(f"Received message: '{incoming_msg}' from {sender}")
-        
         # Get or create memory for this user
-        memory = get_or_create_memory(sender)
+        memory = get_or_create_memory(user_id)
         
         # Convert memory messages to a chat history string for the ReAct agent
         chat_history = "\n".join([
@@ -179,7 +185,7 @@ def bot():
         
         # Invoke the agent with the input and formatted chat history
         agent_response = agent_executor.invoke({
-            "input": incoming_msg,
+            "input": message_text,
             "chat_history": chat_history,
             "system_prompt": system_prompt,
             "tools": "\n".join([f"{tool.name}: {tool.description}" for tool in tools]),
@@ -190,26 +196,61 @@ def bot():
         logger.info(f"Generated response: '{response}'")
         
         # Store the interaction in memory
-        memory.chat_memory.add_user_message(incoming_msg)
+        memory.chat_memory.add_user_message(message_text)
         memory.chat_memory.add_ai_message(response)
         
-        # Format response for Twilio, handling sarcastic comments
+        # Format response, handling sarcastic comments
         formatted_response = format_sarcastic_response(response)
         
-        resp = MessagingResponse()
-        resp.message(formatted_response)
-        
-        twiml_response = str(resp)
-        logger.info(f"TwiML response: {twiml_response}")
-        
-        # Return with proper content type for Twilio
-        return Response(twiml_response, mimetype='text/xml')
+        return formatted_response
     
     except Exception as e:
-        logger.error(f"Error in bot endpoint: {str(e)}", exc_info=True)
-        resp = MessagingResponse()
-        resp.message("Sorry, there was an error processing your request.")
-        return Response(str(resp), mimetype='text/xml')
+        logger.error(f"Error processing message: {str(e)}", exc_info=True)
+        return "Sorry, there was an error processing your request."
+
+# Telegram bot handlers
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the /start command."""
+    welcome_message = "¡Hola! Soy Cristóbal, tu asistente. ¿En qué puedo ayudarte hoy?"
+    await update.message.reply_text(welcome_message)
+
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the /reset command to clear conversation history."""
+    user_id = str(update.effective_user.id)
+    if user_id in user_memories:
+        del user_memories[user_id]
+        await update.message.reply_text("He olvidado nuestra conversación anterior. ¿En qué puedo ayudarte ahora?")
+    else:
+        await update.message.reply_text("No hay conversación que borrar.")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the /help command."""
+    help_text = """
+Comandos disponibles:
+/start - Iniciar la conversación
+/reset - Borrar el historial de la conversación
+/help - Mostrar este mensaje de ayuda
+
+Puedes preguntarme cualquier cosa y te ayudaré lo mejor que pueda.
+También puedo consultar el clima en cualquier lugar.
+"""
+    await update.message.reply_text(help_text)
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming messages."""
+    user_id = str(update.effective_user.id)
+    message_text = update.message.text
+    
+    logger.info(f"Received message: '{message_text}' from user {user_id}")
+    
+    # Send "typing" action to show the bot is processing
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=telegram.constants.ChatAction.TYPING)
+    
+    # Process the message and get response
+    response = await process_message(user_id, message_text)
+    
+    # Send the response back to the user
+    await update.message.reply_text(response, parse_mode='Markdown')
 
 @app.route('/reset', methods=['GET'])
 def reset_conversations():
@@ -218,7 +259,30 @@ def reset_conversations():
     user_memories = {}
     return "All conversations have been reset."
 
-if __name__ == '__main__':
+def run_flask():
+    """Run the Flask application in a separate thread."""
     port = 5001
-    logger.info(f"Starting Bot on port {port}")
-    app.run(debug=True, host='0.0.0.0', port=port)
+    logger.info(f"Starting Flask server on port {port}")
+    app.run(debug=False, host='0.0.0.0', port=port)
+
+if __name__ == '__main__':
+    logger.info("Starting services")
+    
+    # Run Flask in a separate thread
+    import threading
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    
+    # Create the Telegram Application
+    application = ApplicationBuilder().token(telegram_token).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("reset", reset_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    
+    # Run the bot in the main thread
+    logger.info("Starting Telegram Bot")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
