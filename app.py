@@ -20,6 +20,7 @@ from langchain_core.prompts import PromptTemplate
 # Import tools
 from tools.weather_tool import get_weather_tools
 from tools.news_tool import get_news_tools
+from tools.internet_tool import get_internet_tools
 
 # Configure logging
 logging.basicConfig(
@@ -41,7 +42,7 @@ app = Flask(__name__)
 # Initialize LangChain components
 api_key = os.environ.get('GEMINI_API_KEY')
 # Lower temperature for more deterministic outputs and better format compliance
-llm = GoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0.1)
+llm = GoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0.3)
 
 # Get Telegram bot token
 telegram_token = os.environ.get('TELEGRAM_BOT_TOKEN')
@@ -60,12 +61,14 @@ However, at the end of each interaction, show what you really think about the si
 Always speak in Spanish to the user.
 You can check the current weather in any location when requested.
 You can search for the latest news on any topic when requested.
+You can search the internet for information on any topic when requested.
 """
 
 # Collect all tools
 tools = []
 tools.extend(get_weather_tools())
 tools.extend(get_news_tools())
+tools.extend(get_internet_tools())
 
 def get_or_create_memory(user_id: str) -> ConversationBufferMemory:
     """Get existing memory for user or create a new one"""
@@ -160,10 +163,19 @@ def format_sarcastic_response(response):
     # Remove sarcasm tags from the original response
     clean_response = sarcasm_pattern.sub('', response).strip()
     
+    # Remove any backticks from the clean response to prevent Markdown issues
+    clean_response = clean_response.replace('```', '')
+    
     # Add formatted sarcastic comments if they exist
     if sarcasm_matches:
         # Format each sarcastic comment with italics and slightly indented
-        sarcastic_comments = [f"\n\n💭 _{comment.strip()}_" for comment in sarcasm_matches]
+        # Escape any backticks, underscores and asterisks in the sarcastic comments
+        sarcastic_comments = []
+        for comment in sarcasm_matches:
+            # Remove any backticks and escape characters that have special meaning in Markdown
+            safe_comment = comment.strip().replace('```', '').replace('`', '\\`').replace('*', '\\*').replace('_', '\\_')
+            sarcastic_comments.append(f"\n\n💭 _{safe_comment}_")
+        
         clean_response += ''.join(sarcastic_comments)
     
     return clean_response
@@ -231,8 +243,7 @@ Comandos disponibles:
 /reset - Borrar el historial de la conversación
 /help - Mostrar este mensaje de ayuda
 
-Puedes preguntarme cualquier cosa y te ayudaré lo mejor que pueda.
-También puedo consultar el clima en cualquier lugar.
+Puede preguntarme cualquier cosa y le ayudaré lo mejor que pueda.
 """
     await update.message.reply_text(help_text)
 
