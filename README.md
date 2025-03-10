@@ -1,4 +1,4 @@
-# 🤖 WhatsApp AI Assistant (Cristóbal)
+# 🤖 AI Butler (Cristóbal)
 
 ## 📝 Description
 
